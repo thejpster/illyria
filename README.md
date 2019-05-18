@@ -1,4 +1,4 @@
-# Illyria - A selective ARQ using Postcard and COBS
+# Illyria - a stop-and-wait ARQ using postcard + COBS as a serialisation mechanism
 
 Imagine you have two systems connected via a byte-pipe, e.g. a standard UART.
 If you want to send messages between those two systems, the message need to be
