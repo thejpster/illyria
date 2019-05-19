@@ -1,0 +1,7 @@
+language: rust
+rust:
+  - stable
+  - beta
+script:
+  - cargo build -v
+  - cargo test -v
