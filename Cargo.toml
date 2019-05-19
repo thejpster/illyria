@@ -40,3 +40,9 @@ default-features = false
 package = "postcard-cobs"
 version = "0.1.5-pre"
 default-features = false
+
+[dependencies.nb]
+version ="0.1"
+
+[dependencies.embedded-hal]
+version ="0.2"
