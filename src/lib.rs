@@ -3,21 +3,41 @@
 //! Implements a stop-and-wait ARQ using postcard + COBS as a serialisation mechanism.
 //!
 //! See README.md for more details.
+#![cfg_attr(not(test), no_std)]
 
 /// Object for holding protocol state.
-pub struct Illyria<T>
+pub struct Illyria<TX>
 where
-    T: embedded_hal::serial::Write<u8>,
+    TX: embedded_hal::serial::Write<u8>,
+    TX::Error: core::fmt::Debug,
 {
-    transport: T,
-    buffer: [u8; 64],
+    writer: TX,
+    buffer: [u8; 66],
     state: State,
+}
+
+/// The possible errors Illyria can return
+#[derive(Debug)]
+pub enum Error<TE>
+where
+    TE: core::fmt::Debug,
+{
+    WouldBlock,
+    MessageTooLarge,
+    Postcard(postcard::Error),
+    Transport(TE),
+}
+impl<TE> From<TE> for Error<TE> where TE: core::fmt::Debug {
+    fn from(error: TE) -> Error<TE> {
+        Error::Transport(error)
+    }
 }
 
 enum State {
     Idle,
     SendingInitialZero { len: usize },
     Sending { sent: usize, len: usize },
+    SendingFinalZero,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -26,7 +46,6 @@ struct Checksum(u16);
 impl Checksum {
     fn generate(data: &[u8]) -> Checksum {
         let result = Checksum(crc::crc16::checksum_x25(data));
-        println!("Checksum of {:?} is {}/0x{:04x}", data, result.0, result.0);
         result
     }
 
@@ -43,9 +62,10 @@ impl Checksum {
     }
 }
 
-impl<T> Illyria<T>
+impl<TX> Illyria<TX>
 where
-    T: embedded_hal::serial::Write<u8>,
+    TX: embedded_hal::serial::Write<u8>,
+    TX::Error: core::fmt::Debug,
 {
     const COBS_START_IDX: usize = 0;
     const FRAME_TYPE_IDX: usize = 1;
@@ -66,10 +86,10 @@ where
     const ACK: u8 = 2;
     const NACK: u8 = 3;
 
-    pub fn new(transport: T) -> Illyria<T> {
+    pub fn new(writer: TX) -> Illyria<TX> {
         Illyria {
-            transport,
-            buffer: [0u8; 64],
+            writer,
+            buffer: [0u8; 66],
             state: State::Idle,
         }
     }
@@ -78,11 +98,11 @@ where
         self.buffer.len() - Self::COBS_OVERHEAD
     }
 
-    pub fn send<M>(&mut self, message: &M) -> Result<(), ()>
+    pub fn send<M>(&mut self, message: &M) -> Result<(), Error<TX::Error>>
     where
         M: serde::ser::Serialize,
     {
-        let _err = self.transport.flush();
+        let _err = self.writer.flush();
         match postcard::to_slice(message, &mut self.buffer[Self::DATA_IDX..]).map(|buf| buf.len()) {
             Ok(payload_len) => {
                 if payload_len <= self.space() {
@@ -100,10 +120,10 @@ where
                     Ok(())
                 } else {
                     // Message doesn't fit in the buffer when overheads are added
-                    Err(())
+                    Err(Error::MessageTooLarge)
                 }
             }
-            Err(_error) => Err(()),
+            Err(e) => Err(Error::Postcard(e)),
         }
     }
 
@@ -118,13 +138,11 @@ where
             if b == 0 {
                 let gap_to_zero = i - last_idx;
                 self.buffer[last_idx] = gap_to_zero as u8;
-                println!("Setting idx {} to {}", last_idx, gap_to_zero);
                 last_idx = i;
             }
         }
         let gap_to_zero = 1 + len - last_idx;
         self.buffer[last_idx] = gap_to_zero as u8;
-        println!("Setting idx {} to {}", last_idx, gap_to_zero);
         len + 1
     }
 
@@ -132,48 +150,52 @@ where
         self.state = State::Idle;
     }
 
-    pub fn poll(&mut self) -> nb::Result<(), ()> {
-        match self.state {
+    fn writer_write(&mut self, byte: u8) -> Result<(), Error<TX::Error>> {
+        match self.writer.write(byte) {
+            Ok(()) => Ok(()),
+            Err(nb::Error::WouldBlock) => {
+                Err(Error::WouldBlock)
+            }
+            Err(nb::Error::Other(e)) => {
+                Err(Error::Transport(e))
+            }
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<(), Error<TX::Error>> {
+        self.state = match self.state {
             State::Idle => {
                 // Do nothing
-                Ok(())
+                State::Idle
             }
             State::SendingInitialZero { len } => {
-                self.transmit_byte(0x00)?;
-                self.state = State::Sending { sent: 0, len };
-                Ok(())
+                self.writer_write(0x00)?;
+                State::Sending { sent: 0, len }
             }
             State::Sending { sent, len } => {
                 // Send the complete frame
                 let b = self.buffer[sent];
-                self.transmit_byte(b)?;
+                self.writer_write(b)?;
                 let new_sent = sent + 1;
                 if new_sent == len {
-                    self.state = State::Idle;
+                    State::SendingFinalZero
                 } else {
-                    self.state = State::Sending {
+                    State::Sending {
                         sent: new_sent,
                         len,
-                    };
+                    }
                 }
-                Ok(())
             }
-        }
+            State::SendingFinalZero => {
+                self.writer_write(0x00)?;
+                State::Idle
+            }
+        };
+        Ok(())
     }
 
-    fn transmit_byte(&mut self, byte: u8) -> nb::Result<(), ()> {
-        match self.transport.write(byte) {
-            Ok(_) => Ok(()),
-            Err(nb::Error::WouldBlock) => {
-                // Try again later
-                Err(nb::Error::WouldBlock)
-            }
-            Err(nb::Error::Other(_e)) => Err(nb::Error::Other(())),
-        }
-    }
-
-    pub fn access_transport(&mut self) -> &mut T {
-        &mut self.transport
+    pub fn access_writer(&mut self) -> &mut TX {
+        &mut self.writer
     }
 }
 
@@ -183,11 +205,12 @@ mod tests {
     use nb;
     use serde::Serialize;
 
-    struct TestTransport {
+    #[derive(Debug)]
+    struct TestWriter {
         out_buffer: Vec<u8>,
     }
 
-    impl TestTransport {
+    impl TestWriter {
         fn check(&self, expected: &[u8]) {
             assert_eq!(self.out_buffer, expected);
         }
@@ -199,10 +222,11 @@ mod tests {
         B(u32),
         C(bool),
         D([u32; 16]),
+        E([u32; 15]),
     }
 
-    impl embedded_hal::serial::Write<u8> for TestTransport {
-        type Error = ();
+    impl embedded_hal::serial::Write<u8> for TestWriter {
+        type Error = u32;
 
         fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
             self.out_buffer.push(byte);
@@ -217,7 +241,8 @@ mod tests {
 
     #[test]
     fn encode_a() {
-        let t = TestTransport {
+
+        let t = TestWriter {
             out_buffer: Vec::new(),
         };
 
@@ -227,20 +252,21 @@ mod tests {
         for _ in 0..100 {
             illyria.poll().unwrap();
         }
-        illyria.access_transport().check(&[
+        illyria.access_writer().check(&[
             0,                                // COBS delimiter
             3,                                // Gap to next zero
-            Illyria::<TestTransport>::IFRAME, // Frame type
+            Illyria::<TestWriter>::IFRAME,    // Frame type
             1,                                // Length
             3,                                // Payload 0
             0x85,                             // Checksum 0
             0xC8,                             // Checksum 1
+            0,                                // COBS delimiter
         ]);
     }
 
     #[test]
     fn encode_b() {
-        let t = TestTransport {
+        let t = TestWriter {
             out_buffer: Vec::new(),
         };
 
@@ -250,10 +276,10 @@ mod tests {
         for _ in 0..100 {
             illyria.poll().unwrap();
         }
-        illyria.access_transport().check(&[
+        illyria.access_writer().check(&[
             0,                                // COBS delimiter
             10,                               // Gap to next zero
-            Illyria::<TestTransport>::IFRAME, // Frame type
+            Illyria::<TestWriter>::IFRAME,    // Frame type
             5,                                // Length
             1,                                // Payload 0
             9,                                // Payload 1
@@ -262,12 +288,13 @@ mod tests {
             6,                                // Payload 4
             0x1B,                             // Checksum 0
             0xF9,                             // Checksum 1
+            0,                                // COBS delimiter
         ]);
     }
 
     #[test]
     fn encode_c() {
-        let t = TestTransport {
+        let t = TestWriter {
             out_buffer: Vec::new(),
         };
 
@@ -277,21 +304,35 @@ mod tests {
         for _ in 0..100 {
             illyria.poll().unwrap();
         }
-        illyria.access_transport().check(&[
+        illyria.access_writer().check(&[
             0,                                // COBS delimiter
             7,                                // Gap to next zero
-            Illyria::<TestTransport>::IFRAME, // Frame type
+            Illyria::<TestWriter>::IFRAME, // Frame type
             2,                                // Length
             2,                                // Payload 0
             1,                                // Payload 1
             0x77,                             // Checksum 0
             0xE4,                             // Checksum 1
+            0,                                // COBS delimiter
         ]);
     }
 
     #[test]
+    fn encode_full() {
+        let t = TestWriter {
+            out_buffer: Vec::new(),
+        };
+        let mut illyria = Illyria::new(t);
+        illyria.send(&Message::E([0; 15])).unwrap();
+        for _ in 0..100 {
+            illyria.poll().unwrap();
+        }
+        // Don't care what this looks like, just that it fits OK
+    }
+
+    #[test]
     fn encode_too_big() {
-        let t = TestTransport {
+        let t = TestWriter {
             out_buffer: Vec::new(),
         };
         let mut illyria = Illyria::new(t);
