@@ -129,6 +129,12 @@ transmission, and perhaps even having multiple messages in-flight at one time
 (which is better if your transport has a high bandwidth-latency product, e.g.
 you are using a modem).
 
+## Change History
+
+### Unrelease Changes
+
+* Can serialise to a transport. No retries though.
+
 ## Trivia
 
 Illyria was a demon in the 1999-2004 TV series 'Angel'. Illyria inhabited the
