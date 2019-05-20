@@ -31,7 +31,7 @@ where
     TXE: core::fmt::Debug,
     RXE: core::fmt::Debug,
 {
-    WouldBlock,
+    TransportWouldBlock,
     PacketInFlight,
     MessageTooLarge,
     Postcard(postcard::Error),
@@ -222,7 +222,7 @@ where
     fn writer_write(&mut self, byte: u8) -> Result<(), Error<TX::Error, RX::Error>> {
         match self.writer.write(byte) {
             Ok(()) => Ok(()),
-            Err(nb::Error::WouldBlock) => Err(Error::WouldBlock),
+            Err(nb::Error::WouldBlock) => Err(Error::TransportWouldBlock),
             Err(nb::Error::Other(e)) => Err(Error::Writer(e)),
         }
     }
@@ -230,7 +230,7 @@ where
     fn reader_read(&mut self) -> Result<u8, Error<TX::Error, RX::Error>> {
         match self.reader.read() {
             Ok(b) => Ok(b),
-            Err(nb::Error::WouldBlock) => Err(Error::WouldBlock),
+            Err(nb::Error::WouldBlock) => Err(Error::TransportWouldBlock),
             Err(nb::Error::Other(e)) => Err(Error::Reader(e)),
         }
     }
@@ -566,7 +566,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
@@ -609,7 +609,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
@@ -644,7 +644,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
@@ -673,7 +673,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
@@ -699,7 +699,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
@@ -728,7 +728,7 @@ mod tests {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
                 Ok(()) => {}
-                Err(Error::WouldBlock) => {}
+                Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
