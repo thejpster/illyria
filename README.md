@@ -163,6 +163,30 @@ Layer 3 is the public API to the library. It takes in messages which implement
 `serdes::Deserialise`. Byte slices are created for sending down to Layer 3
 using the [postcard](https://docs.rs/postcard) crate.
 
+## Using Illyria
+
+Illyria has two main methods `run_rx` and `run_tx`. Both must be called regularly. If you want a basic system running, just call them both in your main loop:
+
+```
+fn main() -> ! {
+    let mut i = Illyria::new(rx, tx, 100);
+    loop {
+        let _ = i.run_tx();
+        let _ = i.run_rx();
+    }
+}
+```
+
+If you want to send a message, call the `send` method. As long as the type you pass implements `Serializable` from `serdes`, Illyria can convert it into bytes using `postcard` and attempt to deliver it reliably.
+
+```
+let mut illyria = Illyria::new(t, r, 10);
+illyria.send(&Message::A).unwrap();
+for _ in 0..20 {
+    illyria.run_tx().unwrap();
+}
+```
+
 ## Memory
 
 Illyria is a `#![no_std]` crate and does not require `alloc`. When an Illyria
@@ -180,9 +204,12 @@ you are using a modem).
 ### TODO
 
 * More tests
-* Example which uses a pair of serial ports
+* Example which uses a pair of serial ports with flow control
+* Example which uses a pair of serial ports with random byte loss
+* Example which uses a pair of serial ports with random byte corruption
 * Example which uses a loopback TCP socket
 * Colouring packets (Red, Blue or Purple) so retries can be detected and reboots can be tolerated
+* Add a function which says whether Illyria is waiting for an ACK or if the last message was sent OK. You can then spin on this if you just want to send a message in a blocking fashion.
 
 ### Unreleased Changes
 
