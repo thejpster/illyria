@@ -66,7 +66,7 @@ responds when spoken to), but Illyria doesn't mandate this.
     +-----------------------------------+
 ```
 
-### Layer 0
+### Layer 0 - Serial Transport
 
 Layer 0 is our transport. For Illyria, it must be something that implements
 the `embedded-hal::Serial` trait.
@@ -85,30 +85,76 @@ available, or if there is any space to send some bytes. In the future, we
 might have some fancier scheme for determining when it is appropriate to poll
 the transport (e.g. by receiving an interrupt from the Serial hardware).
 
-### Layer 1
+### Layer 1 - COBS Framing
 
 Layer 1 takes in byte slices from above and emits bytes to the transport, one
 at a time. Conversely, it takes in individual bytes (which may arrive some
 time apart), and provides a complete byte slice to the layer above when the
 message is complete. Layer 1 requires some storage space to assemble the
 incoming message, which can be setup when your Illyria object is created.
-Framing is perfomed using Constant Overhead Byte Stuffing, which is a much
-more efficient scheme than the escaping mechanism used in SLIP and HDLC.
+Framing is perfomed using [Consistent Overhead Byte
+Stuffing](https://en.wikipedia.org/wiki/Consistent_Overhead_Byte_Stuffing),
+which is a much more efficient scheme than the escaping mechanism used in SLIP
+and HDLC.
 
-### Layer 2
+### Layer 2 - Burkle Stop-and-Wait ARQ
 
 Layer 2 organises the retries and acknowledgements. It takes byte slices, and
 sends down those byte slices to Layer 1 (perhaps more than once). Conversely
 it takes in byte slices from Layer 1 and sends some subset of those up to
 Layer 3. It can send/receive two sorts of frame:
 
-* I-Frame - these frames contain information (a payload formed of one or more
+* I-Frame - these frames contain information (a payload formed of zero or more
   bytes)
-* S-Frame - these frames contain metadata about the connection (such as ACK
+* S-Frame - these frames contain metadata about the link (such as ACK
   or NAK)
 
-These names are taken from HDLC, but the implementation is different and
-definitely not HDLC compatible.
+These names are taken from
+[HDLC](https://en.wikipedia.org/wiki/High-Level_Data_Link_Control), but the
+implementation is different, and absolutely not HDLC compatible.
+
+Note: This isn't a standard - it's something I've just made up.
+
+#### Frame Format
+
+The S/I-Frame format is as follows, where each `[ x ]` is a byte:
+
+```
+[ header ] [ length ] [ payload0 ] [ payload1 ] ... [ payloadN ] [ checksumUpper ] [ checksumLower ]
+```
+
+The header bytes are:
+
+1. I-Frame - contains payload data
+2. ACK S-Frame - confirms that the most recent I-Frame received by the sender was valid
+3. NACK S-Frame - indicates that the most recent I-Frame received by the send was corrupted and should be re-sent
+
+The length is a value from 0 to 255, and indicates how many payload bytes
+follow (`0` to `N`, where `N` is `length - 1`).
+
+The checksum is the X25 CRC16, expressed as two bytes in big-endian fashion.
+The checksum is over the entire Burkle payload, from the `[header]` to the
+last payload byte (if any).
+
+#### Timeouts
+
+Of course, it is possible for an ACK or NACK S-Frame to be lost or corrupted. The sender of an I-Frame will therefore wait for a period of time for an ACK to be received. If a NACK is received, or too long is spent waiting, the I-Frame will be resent. This continues indefinitely.
+
+#### Example Frame 1
+
+This is an I-Frame, length 3, with the ASCII/UTF-8 payload "123".
+
+```
+[ 0x01, 0x03, 0x31, 0x32, 0x33, 0xBB, 0x86 ]
+```
+
+#### Example Frame 2
+
+This is an ACK S-Frame, length 0.
+
+```
+[ 0x02, 0x00, 0x3C, 0xF7 ]
+```
 
 ### Layer 3
 
@@ -131,12 +177,19 @@ you are using a modem).
 
 ## Change History
 
-### Unrelease Changes
+### TODO
 
-* Can serialise to a transport. No retries though.
-* Started work on receive parser.
+* More tests
+* Example which uses a pair of serial ports
+* Example which uses a loopback TCP socket
+* Colouring packets (Red, Blue or Purple) so retries can be detected and reboots can be tolerated
+
+### Unreleased Changes
+
+* Can serialise to a transport, with retries.
+* Parser can receive and de-COBS, but doesn't run the bytes through Postcard (yet).
 
 ## Trivia
 
 Illyria was a demon in the 1999-2004 TV series 'Angel'. Illyria inhabited the
-body of the character Winifred Burkle, and both were played by Amy Acker.
+body of the character Winifred 'Fred' Burkle, and both were played by Amy Acker.

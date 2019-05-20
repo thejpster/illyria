@@ -2,7 +2,7 @@
 //!
 //! Implements a stop-and-wait ARQ using postcard + COBS as a serialisation mechanism.
 //!
-//! See REEADME.md for more details.
+//! See README.md for more details.
 #![cfg_attr(not(test), no_std)]
 
 /// Object for holding protocol state.
@@ -13,9 +13,12 @@ where
     TX::Error: core::fmt::Debug,
     RX::Error: core::fmt::Debug,
 {
+    poll_limit: u32,
     writer: TX,
     reader: RX,
     tx_buffer: [u8; 66],
+    tx_pending: Option<usize>,
+    sframe_pending: Option<&'static [u8]>,
     rx_buffer: [u8; 66],
     tx_state: TxState,
     rx_state: RxState,
@@ -29,22 +32,28 @@ where
     RXE: core::fmt::Debug,
 {
     WouldBlock,
+    PacketInFlight,
     MessageTooLarge,
     Postcard(postcard::Error),
     Writer(TXE),
     Reader(RXE),
 }
 
+#[derive(Debug)]
 enum TxState {
     Idle,
-    SendingInitialZero { len: usize },
-    Sending { sent: usize, len: usize },
-    SendingFinalZero { len: usize },
-    WaitingForAckNack { len: usize, polls: u32 },
+    SendingFirstIFrameDelimiter { len: usize },
+    SendingIFramePayload { sent: usize, len: usize },
+    SendingFinalIFrameDelimiter { len: usize },
+    WaitingForAckNack { len: usize, num_polls: u32 },
+    SendingFirstSFrameDelimiter { frame: &'static [u8] },
+    SendingSFrame { frame: &'static [u8], send: usize },
+    SendingFinalSFrameDelimiter,
 }
 
+#[derive(Debug)]
 enum RxState {
-    WantInitialZero,
+    WantFrameDelimiter,
     WantCobsHeader,
     WantFrameType {
         cobs: u8,
@@ -116,18 +125,27 @@ where
     /// Slice overhead is the frame overhead, plus the COBS byte
     const COBS_OVERHEAD: usize = Self::FRAME_OVERHEAD + 1;
 
-    const IFRAME: u8 = 1;
-    const ACK: u8 = 2;
-    const NACK: u8 = 3;
+    const HEADER_IFRAME: u8 = 1;
+    const HEADER_ACK: u8 = 2;
+    const HEADER_NACK: u8 = 3;
 
-    pub fn new(writer: TX, reader: RX) -> Illyria<TX, RX> {
+    /// Manually encoded ACK packet, which never changes
+    const SFRAME_ACK: [u8; 5] = [2, Self::HEADER_ACK, 3, 0x3C, 0xF7];
+
+    /// Manually encoded NACK packet, which never changes
+    const SFRAME_NACK: [u8; 5] = [2, Self::HEADER_NACK, 3, 0x25, 0x2F];
+
+    pub fn new(writer: TX, reader: RX, poll_limit: u32) -> Illyria<TX, RX> {
         Illyria {
+            poll_limit,
             writer,
             reader,
             tx_buffer: [0u8; 66],
+            tx_pending: None,
+            sframe_pending: None,
             rx_buffer: [0u8; 66],
             tx_state: TxState::Idle,
-            rx_state: RxState::WantInitialZero,
+            rx_state: RxState::WantFrameDelimiter,
         }
     }
 
@@ -139,30 +157,42 @@ where
     where
         M: serde::ser::Serialize,
     {
-        let _err = self.writer.flush();
-        match postcard::to_slice(message, &mut self.tx_buffer[Self::DATA_IDX..])
-            .map(|buf| buf.len())
-        {
-            Ok(payload_len) => {
-                if payload_len <= self.space() {
-                    // Build a complete frame
-                    self.tx_buffer[Self::FRAME_TYPE_IDX] = Self::IFRAME;
-                    self.tx_buffer[Self::PAYLOAD_LENGTH_IDX] = payload_len as u8;
-                    let checksum = Checksum::generate(
-                        &self.tx_buffer[Self::FRAME_TYPE_IDX
-                            ..Self::FRAME_TYPE_IDX + payload_len + Self::CHECKSUM_OVERHEAD],
-                    );
-                    self.tx_buffer[Self::DATA_IDX + payload_len] = checksum.first_byte();
-                    self.tx_buffer[Self::DATA_IDX + payload_len + 1] = checksum.second_byte();
-                    let slice_length = self.cobs_encode(payload_len + Self::FRAME_OVERHEAD);
-                    self.tx_state = TxState::SendingInitialZero { len: slice_length };
-                    Ok(())
-                } else {
-                    // Message doesn't fit in the tx_buffer when overheads are added
-                    Err(Error::MessageTooLarge)
+        if self.tx_pending.is_some() {
+            return Err(Error::PacketInFlight);
+        }
+        match self.tx_state {
+            TxState::Idle
+            | TxState::SendingFirstSFrameDelimiter { .. }
+            | TxState::SendingSFrame { .. }
+            | TxState::SendingFinalSFrameDelimiter => {
+                let _err = self.writer.flush();
+                match postcard::to_slice(message, &mut self.tx_buffer[Self::DATA_IDX..])
+                    .map(|buf| buf.len())
+                {
+                    Ok(payload_len) => {
+                        if payload_len <= self.space() {
+                            // Build a complete frame
+                            self.tx_buffer[Self::FRAME_TYPE_IDX] = Self::HEADER_IFRAME;
+                            self.tx_buffer[Self::PAYLOAD_LENGTH_IDX] = payload_len as u8;
+                            let checksum = Checksum::generate(
+                                &self.tx_buffer[Self::FRAME_TYPE_IDX
+                                    ..Self::FRAME_TYPE_IDX + payload_len + Self::CHECKSUM_OVERHEAD],
+                            );
+                            self.tx_buffer[Self::DATA_IDX + payload_len] = checksum.first_byte();
+                            self.tx_buffer[Self::DATA_IDX + payload_len + 1] =
+                                checksum.second_byte();
+                            let slice_length = self.cobs_encode(payload_len + Self::FRAME_OVERHEAD);
+                            self.tx_pending = Some(slice_length);
+                            Ok(())
+                        } else {
+                            // Message doesn't fit in the tx_buffer when overheads are added
+                            Err(Error::MessageTooLarge)
+                        }
+                    }
+                    Err(e) => Err(Error::Postcard(e)),
                 }
             }
-            Err(e) => Err(Error::Postcard(e)),
+            _ => Err(Error::PacketInFlight),
         }
     }
 
@@ -209,40 +239,63 @@ where
         self.tx_state = match self.tx_state {
             TxState::Idle => {
                 // Do nothing
-                TxState::Idle
+                if let Some(len) = self.tx_pending {
+                    TxState::SendingFirstIFrameDelimiter { len }
+                } else if let Some(frame) = self.sframe_pending.take() {
+                    TxState::SendingFirstSFrameDelimiter { frame }
+                } else {
+                    TxState::Idle
+                }
             }
-            TxState::SendingInitialZero { len } => {
+            TxState::SendingFirstIFrameDelimiter { len } => {
                 self.writer_write(0x00)?;
-                TxState::Sending { sent: 0, len }
+                TxState::SendingIFramePayload { sent: 0, len }
             }
-            TxState::Sending { sent, len } => {
+            TxState::SendingIFramePayload { sent, len } => {
                 // Send the complete frame
                 let b = self.tx_buffer[sent];
                 self.writer_write(b)?;
                 let new_sent = sent + 1;
                 if new_sent == len {
-                    TxState::SendingFinalZero { len }
+                    TxState::SendingFinalIFrameDelimiter { len }
                 } else {
-                    TxState::Sending {
+                    TxState::SendingIFramePayload {
                         sent: new_sent,
                         len,
                     }
                 }
             }
-            TxState::SendingFinalZero { len } => {
+            TxState::SendingFinalIFrameDelimiter { len } => {
                 self.writer_write(0x00)?;
-                TxState::WaitingForAckNack { polls: 0, len }
+                TxState::WaitingForAckNack { num_polls: 0, len }
             }
-            TxState::WaitingForAckNack { polls, len } => {
-                if polls >= 100 {
-                    // Poll 100 times for ack/nack, else retry
-                    TxState::SendingInitialZero { len }
+            TxState::WaitingForAckNack { num_polls, len } => {
+                if num_polls >= self.poll_limit {
+                    // Poll N times for ack/nack, else retry
+                    TxState::SendingFirstIFrameDelimiter { len }
                 } else {
                     TxState::WaitingForAckNack {
-                        polls: polls + 1,
+                        num_polls: num_polls + 1,
                         len,
                     }
                 }
+            }
+            TxState::SendingFirstSFrameDelimiter { frame } => {
+                self.writer_write(0x00)?;
+                TxState::SendingSFrame { frame, send: 0 }
+            }
+            TxState::SendingSFrame { frame, send } => {
+                self.writer_write(frame[send])?;
+                let send = send + 1;
+                if send == frame.len() {
+                    TxState::SendingFinalSFrameDelimiter
+                } else {
+                    TxState::SendingSFrame { frame, send }
+                }
+            }
+            TxState::SendingFinalSFrameDelimiter => {
+                self.writer_write(0x00)?;
+                TxState::Idle
             }
         };
         Ok(())
@@ -263,7 +316,7 @@ where
             self.rx_state = RxState::WantCobsHeader;
         } else {
             self.rx_state = match self.rx_state {
-                RxState::WantInitialZero => RxState::WantInitialZero,
+                RxState::WantFrameDelimiter => RxState::WantFrameDelimiter,
                 RxState::WantCobsHeader => RxState::WantFrameType { cobs: next_byte },
                 RxState::WantFrameType { cobs } => {
                     let (cobs, next_byte) = Self::check_cobs(cobs, next_byte);
@@ -285,7 +338,7 @@ where
                             cobs,
                             frame,
                             length: next_byte as usize,
-                            received: 2,
+                            received: 0,
                         }
                     }
                 }
@@ -297,11 +350,12 @@ where
                 } => {
                     if received >= self.rx_buffer.len() {
                         // This packet is too long - drop it on the floor
-                        RxState::WantInitialZero
+                        RxState::WantFrameDelimiter
                     } else {
                         let (cobs, next_byte) = Self::check_cobs(cobs, next_byte);
-                        self.rx_buffer[received] = next_byte;
-                        if received == length + Self::CHECKSUM_OVERHEAD {
+                        self.rx_buffer[received + Self::CHECKSUM_OVERHEAD] = next_byte;
+                        let received = received + 1;
+                        if received == length {
                             RxState::WantChecksumFirst {
                                 cobs,
                                 frame,
@@ -312,7 +366,7 @@ where
                                 cobs,
                                 frame,
                                 length,
-                                received: received + 1,
+                                received,
                             }
                         }
                     }
@@ -343,14 +397,35 @@ where
                     self.rx_buffer[1] = length as u8;
                     if csum.validate(&self.rx_buffer[0..length + 2]) {
                         // Good packet
-                        // 1. Schedule an ACK
-                        // 2. Return the good packet to the caller
+                        match frame {
+                            Self::HEADER_IFRAME => {
+                                // 1. Schedule an ACK
+                                self.sframe_pending = Some(&Self::SFRAME_ACK);
+                                // 2. Return the good packet to the caller
+                                // TODO
+                            }
+                            Self::HEADER_ACK => {
+                                if let TxState::WaitingForAckNack { .. } = self.tx_state {
+                                    self.tx_state = TxState::Idle;
+                                    self.tx_pending = None;
+                                }
+                            }
+                            Self::HEADER_NACK => {
+                                if let TxState::WaitingForAckNack { .. } = self.tx_state {
+                                    self.tx_state = TxState::Idle;
+                                    // leave tx_pending so we re-send
+                                }
+                            }
+                            _ => {
+                                // Valid, but not understood. This is a protocol error.
+                            }
+                        }
                     } else {
                         // Bad packet
-                        // 1. Schedule an NACK
+                        self.sframe_pending = Some(&Self::SFRAME_NACK);
                     }
                     // Now start over
-                    RxState::WantInitialZero
+                    RxState::WantFrameDelimiter
                 }
             };
         }
@@ -424,6 +499,254 @@ mod tests {
     }
 
     #[test]
+    fn timeout_message() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = Illyria::new(t, r, 10);
+
+        illyria.send(&Message::A).unwrap();
+        for _ in 0..17 {
+            illyria.run_tx().unwrap();
+        }
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            3,    // Gap to next zero
+            1,    // Frame type
+            1,    // Length
+            3,    // Payload 0
+            0x85, // Checksum 0
+            0xC8, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+        illyria.access_writer().out_tx_buffer.truncate(0);
+        // This should cause a retry
+        for _ in 0..11 {
+            illyria.run_tx().unwrap();
+        }
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            3,    // Gap to next zero
+            1,    // Frame type
+            1,    // Length
+            3,    // Payload 0
+            0x85, // Checksum 0
+            0xC8, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+    }
+
+    #[test]
+    fn rx_message() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = Illyria::new(t, r, 10);
+
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+        illyria.access_reader().source.push_back(3); // Gap to next zero
+        illyria.access_reader().source.push_back(1); // Frame type
+        illyria.access_reader().source.push_back(1); // Length
+        illyria.access_reader().source.push_back(3); // Payload 0
+        illyria.access_reader().source.push_back(0x85); // Checksum 0
+        illyria.access_reader().source.push_back(0xC8); // Checksum 1
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+
+        for _ in 0..20 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            2,    // Gap to next zero
+            2,    // Frame type
+            3,    // Length
+            0x3C, // Checksum 0
+            0xF7, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+    }
+
+    #[test]
+    fn rx_bad_message() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = Illyria::new(t, r, 10);
+
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+        illyria.access_reader().source.push_back(3); // Gap to next zero
+        illyria.access_reader().source.push_back(1); // Frame type
+        illyria.access_reader().source.push_back(1); // Length
+        illyria.access_reader().source.push_back(3); // Payload 0
+        illyria.access_reader().source.push_back(0xFF); // Checksum 0
+        illyria.access_reader().source.push_back(0xC8); // Checksum 1
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+
+        for _ in 0..20 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            2,    // Gap to next zero
+            3,    // Frame type
+            3,    // Length
+            0x25, // Checksum 0
+            0x2F, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+    }
+
+    #[test]
+    fn ack_message() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = Illyria::new(t, r, 50);
+
+        illyria.send(&Message::A).unwrap();
+        for _ in 0..17 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            3,    // Gap to next zero
+            1,    // Frame type
+            1,    // Length
+            3,    // Payload 0
+            0x85, // Checksum 0
+            0xC8, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+        // Send an ACK
+        illyria.access_reader().source.push_back(0);
+        illyria.access_reader().source.push_back(2);
+        illyria.access_reader().source.push_back(2);
+        illyria.access_reader().source.push_back(3);
+        illyria.access_reader().source.push_back(0x3C);
+        illyria.access_reader().source.push_back(0xF7);
+        illyria.access_writer().out_tx_buffer.truncate(0);
+        // This should not cause a retry because it's been acked
+        for _ in 0..50 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+        illyria.access_writer().check(&[]);
+    }
+
+    #[test]
+    fn nack_message() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = Illyria::new(t, r, 50);
+
+        illyria.send(&Message::A).unwrap();
+        for _ in 0..17 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            3,    // Gap to next zero
+            1,    // Frame type
+            1,    // Length
+            3,    // Payload 0
+            0x85, // Checksum 0
+            0xC8, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+        // Send a NACK
+        illyria.access_reader().source.push_back(0);
+        illyria.access_reader().source.push_back(2);
+        illyria.access_reader().source.push_back(3);
+        illyria.access_reader().source.push_back(3);
+        illyria.access_reader().source.push_back(0x25);
+        illyria.access_reader().source.push_back(0x2F);
+        illyria.access_writer().out_tx_buffer.truncate(0);
+        // This should cause a retry because it's been nacked
+        for _ in 0..50 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(()) => {}
+                Err(Error::WouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            3,    // Gap to next zero
+            1,    // Frame type
+            1,    // Length
+            3,    // Payload 0
+            0x85, // Checksum 0
+            0xC8, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+    }
+
+    #[test]
     fn encode_a() {
         let t = TestWriter {
             out_tx_buffer: Vec::new(),
@@ -433,10 +756,10 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria = Illyria::new(t, r);
+        let mut illyria = Illyria::new(t, r, 100);
 
         illyria.send(&Message::A).unwrap();
-        for _ in 0..100 {
+        for _ in 0..50 {
             illyria.run_tx().unwrap();
         }
         illyria.access_writer().check(&[
@@ -461,10 +784,10 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria = Illyria::new(t, r);
+        let mut illyria = Illyria::new(t, r, 100);
 
         illyria.send(&Message::B(0x06070809)).unwrap();
-        for _ in 0..100 {
+        for _ in 0..50 {
             illyria.run_tx().unwrap();
         }
         illyria.access_writer().check(&[
@@ -493,10 +816,10 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria = Illyria::new(t, r);
+        let mut illyria = Illyria::new(t, r, 100);
 
         illyria.send(&Message::C(true)).unwrap();
-        for _ in 0..100 {
+        for _ in 0..50 {
             illyria.run_tx().unwrap();
         }
         illyria.access_writer().check(&[
@@ -522,9 +845,9 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria = Illyria::new(t, r);
+        let mut illyria = Illyria::new(t, r, 100);
         illyria.send(&Message::E([0; 15])).unwrap();
-        for _ in 0..100 {
+        for _ in 0..50 {
             illyria.run_tx().unwrap();
         }
         // Don't care what this looks like, just that it fits OK
@@ -540,7 +863,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria = Illyria::new(t, r);
+        let mut illyria = Illyria::new(t, r, 10);
         assert!(illyria.send(&Message::D([0; 16])).is_err());
     }
 }
