@@ -138,7 +138,7 @@ where
     }
 
     pub fn space(&self) -> usize {
-        self.tx_buffer.capacity()
+        self.tx_buffer.capacity() - Self::FRAME_OVERHEAD
     }
 
     pub fn send<M>(&mut self, message: &M) -> Result<(), Error<TX::Error, RX::Error>>
@@ -154,6 +154,10 @@ where
                 payload: Payload::SFrame(_),
                 ..
             }
+            | TxState::SendingCobsHeader {
+                payload: Payload::SFrame(_),
+                ..
+            }
             | TxState::SendingPayload {
                 payload: Payload::SFrame(_),
                 ..
@@ -166,27 +170,22 @@ where
                 self.tx_buffer
                     .resize_default(self.tx_buffer.capacity())
                     .unwrap();
-                match postcard::to_slice(message, &mut self.tx_buffer[Self::DATA_IDX..])
+                let usable = self.tx_buffer.len() - 2;
+                match postcard::to_slice(message, &mut self.tx_buffer[Self::DATA_IDX..usable])
                     .map(|buf| buf.len())
                 {
                     Ok(payload_len) => {
-                        if payload_len <= self.space() {
-                            // Build a complete frame
-                            self.tx_buffer[Self::FRAME_TYPE_IDX] = Self::HEADER_IFRAME;
-                            self.tx_buffer[Self::PAYLOAD_LENGTH_IDX] = payload_len as u8;
-                            let checksum = Checksum::generate(
-                                &self.tx_buffer[Self::FRAME_TYPE_IDX
-                                    ..Self::FRAME_TYPE_IDX + payload_len + Self::CHECKSUM_OVERHEAD],
-                            );
-                            self.tx_buffer[Self::DATA_IDX + payload_len] = checksum.first_byte();
-                            self.tx_buffer[Self::DATA_IDX + payload_len + 1] =
-                                checksum.second_byte();
-                            self.tx_buffer.truncate(payload_len + Self::FRAME_OVERHEAD);
-                            Ok(())
-                        } else {
-                            // Message doesn't fit in the tx_buffer when overheads are added
-                            Err(Error::MessageTooLarge)
-                        }
+                        // Build a complete frame (it definitely fits)
+                        self.tx_buffer[Self::FRAME_TYPE_IDX] = Self::HEADER_IFRAME;
+                        self.tx_buffer[Self::PAYLOAD_LENGTH_IDX] = payload_len as u8;
+                        let checksum_idx =
+                            Self::FRAME_TYPE_IDX + Self::CHECKSUM_OVERHEAD + payload_len;
+                        let checksum =
+                            Checksum::generate(&self.tx_buffer[Self::FRAME_TYPE_IDX..checksum_idx]);
+                        self.tx_buffer[checksum_idx] = checksum.first_byte();
+                        self.tx_buffer[checksum_idx + 1] = checksum.second_byte();
+                        self.tx_buffer.truncate(Self::FRAME_OVERHEAD + payload_len);
+                        Ok(())
                     }
                     Err(e) => Err(Error::Postcard(e)),
                 }
