@@ -3,7 +3,7 @@
 //! Implements a stop-and-wait ARQ using postcard + COBS as a serialisation mechanism.
 //!
 //! See README.md for more details.
-//#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_std)]
 
 /// Object for holding protocol state.
 pub struct Illyria<TX, RX, TXLEN, RXLEN>
@@ -262,7 +262,6 @@ where
     }
 
     pub fn cobs_find_zero(&self, source: &[u8]) -> usize {
-        println!("Finding next 0 in {:?}", source);
         let mut num = source.len();
         for (i, &b) in source.iter().enumerate() {
             if b == 0 {
@@ -273,14 +272,12 @@ where
                 break;
             }
         }
-        println!("Found at {} ({})", num, num + 1);
         num
     }
 
     /// Pumps the TX state machine. Returns `true` if it makes sense to call this function again right away.
     /// Returns `false` if we're stuck waiting for an ack and you should wait a while before trying again.
     pub fn run_tx(&mut self) -> Result<WaitingForAckNack, Error<TX::Error, RX::Error>> {
-        println!("run_tx in state {:?}", self.tx_state);
         let mut result = WaitingForAckNack::No;
         self.tx_state = match self.tx_state {
             TxState::Idle => {
@@ -368,7 +365,6 @@ where
     }
 
     pub fn run_rx(&mut self) -> Result<(), Error<TX::Error, RX::Error>> {
-        println!("run_rx in state {:?}", self.rx_state);
         let next_byte = self.reader_read()?;
         if next_byte == 0 {
             // Applies in any state
@@ -440,7 +436,6 @@ where
                     let csum = Checksum(((csum_first as u16) << 8) | next_byte as u16);
                     if csum.validate(&self.rx_buffer) {
                         // Good packet
-                        println!("Got good frame {:?}, type 0x{:02x}", self.rx_buffer, frame);
                         match frame {
                             Self::HEADER_RED_IFRAME => {
                                 // 1. Schedule an ACK (even for duplicates)
@@ -487,12 +482,10 @@ where
                             }
                             _ => {
                                 // Valid, but not understood. This is a protocol error.
-                                println!("Did not understand 0x{:02x}", frame);
                             }
                         }
                     } else {
                         // Bad packet
-                        println!("Bad packet {:?}", self.rx_buffer);
                         self.sframe_pending = Some(&Self::SFRAME_NACK);
                     }
                     // Empty the RX buffer
@@ -550,7 +543,6 @@ mod tests {
         type Error = ();
 
         fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
-            println!("Wrote 0x{:02x}", byte);
             self.out_tx_buffer.push(byte);
             Ok(())
         }
@@ -567,11 +559,9 @@ mod tests {
         fn read(&mut self) -> nb::Result<u8, Self::Error> {
             match self.source.pop_front() {
                 Some(b) => {
-                    println!("Read 0x{:02x}", b);
                     Ok(b)
                 }
                 None => {
-                    println!("Read blocked");
                     Err(nb::Error::WouldBlock)
                 }
             }
@@ -786,7 +776,6 @@ mod tests {
             [0, 3, MyIllyria::HEADER_RED_IFRAME, 1, 3, 0x86, 0xF3, 0],
             [0, 3, MyIllyria::HEADER_BLUE_IFRAME, 1, 1, 2, 0x5D, 0],
         ] {
-            println!("Sending message, expecting {:?}", expected_frame);
             illyria.send(&Message::A).unwrap();
             for _ in 0..17 {
                 illyria.run_tx().unwrap();
