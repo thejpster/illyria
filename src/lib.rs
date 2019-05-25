@@ -22,7 +22,15 @@ where
     sframe_pending: Option<&'static [u8]>,
     rx_buffer: heapless::Vec<u8, RXLEN>,
     tx_state: TxState,
+    next_tx_colour: Colour,
     rx_state: RxState,
+    rx_colour: Colour,
+}
+
+#[derive(Debug)]
+pub enum WaitingForAckNack {
+    Yes,
+    No,
 }
 
 /// The possible errors Illyria can return
@@ -65,6 +73,37 @@ enum RxState {
     WantPayload { cobs: u8, frame: u8, length: usize },
     WantChecksumFirst { cobs: u8, frame: u8 },
     WantChecksumSecond { cobs: u8, frame: u8, csum_first: u8 },
+}
+
+/// We colour our packets in order to detect duplicates. There are red packets
+/// and blue packets and we alternate. Each receiver tracks the colour it
+/// wants next, with a special case of 'Purple' to handle the case of either
+/// end rebooting and not knowing what should be sent/received next.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+enum Colour {
+    /// Red packets will only be seen by a Red or Purple receiver. A Blue receiver will drop them as duplicates.
+    Red,
+    /// Blue packets will only be seen by a Blue or Purple receiver. A Red receiver will drop them as duplicates.
+    Blue,
+    /// A Purple receiver will accept either Red or Blue packets. It will then
+    /// move the opposite state of whichever one it just received. Purple
+    /// packets can be received by either Blue or Red receiver, and will force
+    /// the receive state appropriately.
+    Purple,
+}
+
+impl Colour {
+    fn next(self) -> Colour {
+        match self {
+            Colour::Red => Colour::Blue,
+            Colour::Blue => Colour::Red,
+            Colour::Purple => Colour::Blue,
+        }
+    }
+
+    fn matches(self, incoming: Colour) -> bool {
+        (self == Colour::Purple) || (incoming == Colour::Purple) || (self == incoming)
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -110,19 +149,21 @@ where
     /// checksum.
     const FRAME_OVERHEAD: usize = Self::CHECKSUM_OVERHEAD + 2;
 
-    const HEADER_IFRAME: u8 = 1;
-    const HEADER_ACK: u8 = 2;
-    const HEADER_NACK: u8 = 3;
+    const HEADER_RED_IFRAME: u8 = 0x21;
+    const HEADER_BLUE_IFRAME: u8 = 0x11;
+    const HEADER_PURPLE_IFRAME: u8 = 0x01;
+    const HEADER_ACK: u8 = 0x02;
+    const HEADER_NACK: u8 = 0x03;
 
-    /// Manually encoded ACK packet, which never changes. We could render it
+    /// Manually encoded Red ACK packet, which never changes. We could render it
     /// into the tx_buffer but keeping it separate lets us cache a packet for
     /// TX while we send an ACK.
     const SFRAME_ACK: [u8; 4] = [Self::HEADER_ACK, 0, 0x3C, 0xF7];
 
-    /// Manually encoded NACK packet, which never changes. We could render it
+    /// Manually encoded Purple NACK packet, which never changes. We could render it
     /// into the tx_buffer but keeping it separate lets us cache a packet for
-    /// TX while we send an ACK.
-    const SFRAME_NACK: [u8; 4] = [Self::HEADER_NACK, 0, 0x25, 0x2F];
+    /// TX while we send an NACK.
+    const SFRAME_NACK: [u8; 4] = [Self::HEADER_NACK, 0, 0x3C, 0xF7];
 
     pub fn new(writer: TX, reader: RX, poll_limit: u32) -> Illyria<TX, RX, TXLEN, RXLEN> {
         Illyria {
@@ -133,7 +174,9 @@ where
             sframe_pending: None,
             rx_buffer: heapless::Vec::new(),
             tx_state: TxState::Idle,
+            next_tx_colour: Colour::Purple,
             rx_state: RxState::WantFrameDelimiter,
+            rx_colour: Colour::Purple,
         }
     }
 
@@ -176,7 +219,11 @@ where
                 {
                     Ok(payload_len) => {
                         // Build a complete frame (it definitely fits)
-                        self.tx_buffer[Self::FRAME_TYPE_IDX] = Self::HEADER_IFRAME;
+                        self.tx_buffer[Self::FRAME_TYPE_IDX] = match self.next_tx_colour {
+                            Colour::Red => Self::HEADER_RED_IFRAME,
+                            Colour::Blue => Self::HEADER_BLUE_IFRAME,
+                            Colour::Purple => Self::HEADER_PURPLE_IFRAME,
+                        };
                         self.tx_buffer[Self::PAYLOAD_LENGTH_IDX] = payload_len as u8;
                         let checksum_idx =
                             Self::FRAME_TYPE_IDX + Self::CHECKSUM_OVERHEAD + payload_len;
@@ -215,7 +262,7 @@ where
     }
 
     pub fn cobs_find_zero(&self, source: &[u8]) -> usize {
-        println!("Finding next 0 in {:?}", self.tx_buffer);
+        println!("Finding next 0 in {:?}", source);
         let mut num = source.len();
         for (i, &b) in source.iter().enumerate() {
             if b == 0 {
@@ -226,11 +273,15 @@ where
                 break;
             }
         }
-        println!("Found at {}", num);
+        println!("Found at {} ({})", num, num + 1);
         num
     }
 
-    pub fn run_tx(&mut self) -> Result<(), Error<TX::Error, RX::Error>> {
+    /// Pumps the TX state machine. Returns `true` if it makes sense to call this function again right away.
+    /// Returns `false` if we're stuck waiting for an ack and you should wait a while before trying again.
+    pub fn run_tx(&mut self) -> Result<WaitingForAckNack, Error<TX::Error, RX::Error>> {
+        println!("run_tx in state {:?}", self.tx_state);
+        let mut result = WaitingForAckNack::No;
         self.tx_state = match self.tx_state {
             TxState::Idle => {
                 // Do nothing
@@ -298,13 +349,14 @@ where
                         payload: Payload::IFrame,
                     }
                 } else {
+                    result = WaitingForAckNack::Yes;
                     TxState::WaitingForAckNack {
                         num_polls: num_polls + 1,
                     }
                 }
             }
         };
-        Ok(())
+        Ok(result)
     }
 
     fn check_cobs(cobs: u8, next_byte: u8) -> (u8, u8) {
@@ -316,6 +368,7 @@ where
     }
 
     pub fn run_rx(&mut self) -> Result<(), Error<TX::Error, RX::Error>> {
+        println!("run_rx in state {:?}", self.rx_state);
         let next_byte = self.reader_read()?;
         if next_byte == 0 {
             // Applies in any state
@@ -387,15 +440,41 @@ where
                     let csum = Checksum(((csum_first as u16) << 8) | next_byte as u16);
                     if csum.validate(&self.rx_buffer) {
                         // Good packet
+                        println!("Got good frame {:?}, type 0x{:02x}", self.rx_buffer, frame);
                         match frame {
-                            Self::HEADER_IFRAME => {
-                                // 1. Schedule an ACK
+                            Self::HEADER_RED_IFRAME => {
+                                // 1. Schedule an ACK (even for duplicates)
                                 self.sframe_pending = Some(&Self::SFRAME_ACK);
-                                // 2. Return the good packet to the caller
-                                // TODO
+                                // 2. Check if our Red IFRAME is what we expected
+                                if self.rx_colour.matches(Colour::Red) {
+                                    // A. Update our expectation.
+                                    self.rx_colour = Colour::next(Colour::Red);
+                                    // B. Tell the higher layer about it.
+                                }
+                            }
+                            Self::HEADER_BLUE_IFRAME => {
+                                // 1. Schedule an ACK (even for duplicates)
+                                self.sframe_pending = Some(&Self::SFRAME_ACK);
+                                // 2. Check if our Red IFRAME is what we expected
+                                if self.rx_colour.matches(Colour::Blue) {
+                                    // A. Update our expectation.
+                                    self.rx_colour = Colour::Blue.next();
+                                    // B. Tell the higher layer about it.
+                                }
+                            }
+                            Self::HEADER_PURPLE_IFRAME => {
+                                // 1. Schedule an ACK (even for duplicates)
+                                self.sframe_pending = Some(&Self::SFRAME_ACK);
+                                // 2. Check if our Red IFRAME is what we expected
+                                if self.rx_colour.matches(Colour::Purple) {
+                                    // A. Update our expectation.
+                                    self.rx_colour = Colour::Purple.next();
+                                    // B. Tell the higher layer about it.
+                                }
                             }
                             Self::HEADER_ACK => {
                                 if let TxState::WaitingForAckNack { .. } = self.tx_state {
+                                    self.next_tx_colour = self.next_tx_colour.next();
                                     self.tx_state = TxState::Idle;
                                     self.tx_buffer.truncate(0);
                                 }
@@ -408,12 +487,16 @@ where
                             }
                             _ => {
                                 // Valid, but not understood. This is a protocol error.
+                                println!("Did not understand 0x{:02x}", frame);
                             }
                         }
                     } else {
                         // Bad packet
+                        println!("Bad packet {:?}", self.rx_buffer);
                         self.sframe_pending = Some(&Self::SFRAME_NACK);
                     }
+                    // Empty the RX buffer
+                    self.rx_buffer.truncate(0);
                     // Now start over
                     RxState::WantFrameDelimiter
                 }
@@ -467,6 +550,7 @@ mod tests {
         type Error = ();
 
         fn write(&mut self, byte: u8) -> nb::Result<(), Self::Error> {
+            println!("Wrote 0x{:02x}", byte);
             self.out_tx_buffer.push(byte);
             Ok(())
         }
@@ -482,11 +566,19 @@ mod tests {
 
         fn read(&mut self) -> nb::Result<u8, Self::Error> {
             match self.source.pop_front() {
-                Some(b) => Ok(b),
-                None => Err(nb::Error::WouldBlock),
+                Some(b) => {
+                    println!("Read 0x{:02x}", b);
+                    Ok(b)
+                }
+                None => {
+                    println!("Read blocked");
+                    Err(nb::Error::WouldBlock)
+                }
             }
         }
     }
+
+    type MyIllyria = Illyria<TestWriter, TestReader, heapless::consts::U66, heapless::consts::U66>;
 
     #[test]
     fn timeout_message() {
@@ -498,8 +590,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 10);
+        let mut illyria: MyIllyria = MyIllyria::new(t, r, 10);
 
         illyria.send(&Message::A).unwrap();
         for _ in 0..17 {
@@ -542,8 +633,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 10);
+        let mut illyria = MyIllyria::new(t, r, 10);
 
         illyria.access_reader().source.push_back(0); // COBS delimiter
         illyria.access_reader().source.push_back(3); // Gap to next zero
@@ -586,15 +676,17 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 10);
+        let mut illyria = MyIllyria::new(t, r, 10);
 
         illyria.access_reader().source.push_back(0); // COBS delimiter
         illyria.access_reader().source.push_back(3); // Gap to next zero
-        illyria.access_reader().source.push_back(1); // Frame type
+        illyria
+            .access_reader()
+            .source
+            .push_back(MyIllyria::HEADER_PURPLE_IFRAME); // Frame type
         illyria.access_reader().source.push_back(1); // Length
         illyria.access_reader().source.push_back(3); // Payload 0
-        illyria.access_reader().source.push_back(0xFF); // Checksum 0
+        illyria.access_reader().source.push_back(0xFF); // Checksum 0 (bad)
         illyria.access_reader().source.push_back(0xC8); // Checksum 1
         illyria.access_reader().source.push_back(0); // COBS delimiter
 
@@ -609,14 +701,15 @@ mod tests {
             }
         }
 
+        // Should be a COBS-encoded NACK frame
         illyria.access_writer().check(&[
-            0,    // COBS delimiter
-            2,    // Gap to next zero
-            3,    // Frame type
-            3,    // Length
-            0x25, // Checksum 0
-            0x2F, // Checksum 1
-            0,    // COBS delimiter
+            0,                      // COBS delimiter
+            2,                      // Gap to next zero
+            MyIllyria::HEADER_NACK, // Frame type
+            3,                      // Length (zero, replaced with gap to next zero)
+            0x3C,                   // Checksum 0
+            0xF7,                   // Checksum 1
+            0,                      // COBS delimiter
         ]);
     }
 
@@ -630,8 +723,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 50);
+        let mut illyria = MyIllyria::new(t, r, 50);
 
         illyria.send(&Message::A).unwrap();
         for _ in 0..17 {
@@ -677,6 +769,64 @@ mod tests {
     }
 
     #[test]
+    fn duplicates() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = MyIllyria::new(t, r, 50);
+        for &expected_frame in &[
+            // purple = 01, blue = 11, red = 21
+            [0, 3, MyIllyria::HEADER_PURPLE_IFRAME, 1, 3, 0x85, 0xC8, 0],
+            [0, 3, MyIllyria::HEADER_BLUE_IFRAME, 1, 1, 2, 0x5D, 0],
+            [0, 3, MyIllyria::HEADER_RED_IFRAME, 1, 3, 0x86, 0xF3, 0],
+            [0, 3, MyIllyria::HEADER_BLUE_IFRAME, 1, 1, 2, 0x5D, 0],
+        ] {
+            println!("Sending message, expecting {:?}", expected_frame);
+            illyria.send(&Message::A).unwrap();
+            for _ in 0..17 {
+                illyria.run_tx().unwrap();
+                match illyria.run_rx() {
+                    Ok(()) => {}
+                    Err(Error::TransportWouldBlock) => {}
+                    Err(e) => {
+                        panic!("Got error {:?}", e);
+                    }
+                }
+            }
+            illyria.access_writer().check(&expected_frame);
+
+            // Send an ACK
+            illyria.access_reader().source.push_back(0); // COBS delimiter
+            illyria.access_reader().source.push_back(2); // Gap to next zero
+            illyria
+                .access_reader()
+                .source
+                .push_back(MyIllyria::HEADER_ACK); // Frame type
+            illyria.access_reader().source.push_back(3); // Length, actually zero but replaced with gap to next zero
+            illyria.access_reader().source.push_back(0x3C); // Checksum 0
+            illyria.access_reader().source.push_back(0xF7); // Checksum 1
+            illyria.access_writer().out_tx_buffer.truncate(0);
+            // This should not cause a retry because it's been acked
+            for _ in 0..50 {
+                illyria.run_tx().unwrap();
+                match illyria.run_rx() {
+                    Ok(()) => {}
+                    Err(Error::TransportWouldBlock) => {}
+                    Err(e) => {
+                        panic!("Got error {:?}", e);
+                    }
+                }
+            }
+            illyria.access_writer().check(&[]);
+        }
+    }
+
+    #[test]
     fn nack_message() {
         let t = TestWriter {
             out_tx_buffer: Vec::new(),
@@ -686,8 +836,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 50);
+        let mut illyria = MyIllyria::new(t, r, 50);
 
         illyria.send(&Message::A).unwrap();
         for _ in 0..17 {
@@ -751,8 +900,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 100);
+        let mut illyria = MyIllyria::new(t, r, 100);
 
         illyria.send(&Message::A).unwrap();
         for _ in 0..50 {
@@ -780,8 +928,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 100);
+        let mut illyria = MyIllyria::new(t, r, 100);
 
         illyria.send(&Message::B(0x06070809)).unwrap();
         for _ in 0..50 {
@@ -813,8 +960,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 100);
+        let mut illyria = MyIllyria::new(t, r, 100);
 
         illyria.send(&Message::C(true)).unwrap();
         for _ in 0..50 {
@@ -843,8 +989,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 100);
+        let mut illyria = MyIllyria::new(t, r, 100);
         illyria.send(&Message::E([0; 15])).unwrap();
         for _ in 0..50 {
             illyria.run_tx().unwrap();
@@ -862,8 +1007,7 @@ mod tests {
             source: VecDeque::new(),
         };
 
-        let mut illyria: Illyria<_, _, heapless::consts::U66, heapless::consts::U66> =
-            Illyria::new(t, r, 10);
+        let mut illyria = MyIllyria::new(t, r, 10);
         assert!(illyria.send(&Message::D([0; 16])).is_err());
     }
 }
