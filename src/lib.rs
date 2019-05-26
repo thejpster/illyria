@@ -6,18 +6,20 @@
 #![cfg_attr(not(test), no_std)]
 
 /// Object for holding protocol state.
-pub struct Illyria<TX, RX, TXLEN, RXLEN>
+pub struct Illyria<TXM, RXM, TXO, RXI, TXLEN, RXLEN>
 where
-    TX: embedded_hal::serial::Write<u8>,
-    RX: embedded_hal::serial::Read<u8>,
-    TX::Error: core::fmt::Debug,
-    RX::Error: core::fmt::Debug,
+    TXM: serde::ser::Serialize,
+    RXM: serde::de::DeserializeOwned,
+    TXO: embedded_hal::serial::Write<u8>,
+    RXI: embedded_hal::serial::Read<u8>,
+    TXO::Error: core::fmt::Debug,
+    RXI::Error: core::fmt::Debug,
     RXLEN: heapless::ArrayLength<u8>,
     TXLEN: heapless::ArrayLength<u8>,
 {
     poll_limit: u32,
-    writer: TX,
-    reader: RX,
+    writer: TXO,
+    reader: RXI,
     tx_buffer: heapless::Vec<u8, TXLEN>,
     sframe_pending: Option<&'static [u8]>,
     rx_buffer: heapless::Vec<u8, RXLEN>,
@@ -25,6 +27,7 @@ where
     next_tx_colour: Colour,
     rx_state: RxState,
     rx_colour: Colour,
+    _phantom: core::marker::PhantomData<(TXM, RXM)>,
 }
 
 #[derive(Debug)]
@@ -128,12 +131,14 @@ impl Checksum {
     }
 }
 
-impl<TX, RX, TXLEN, RXLEN> Illyria<TX, RX, TXLEN, RXLEN>
+impl<TXM, RXM, TXO, RXI, TXLEN, RXLEN> Illyria<TXM, RXM, TXO, RXI, TXLEN, RXLEN>
 where
-    TX: embedded_hal::serial::Write<u8>,
-    RX: embedded_hal::serial::Read<u8>,
-    TX::Error: core::fmt::Debug,
-    RX::Error: core::fmt::Debug,
+    TXM: serde::ser::Serialize,
+    RXM: serde::de::DeserializeOwned,
+    TXO: embedded_hal::serial::Write<u8>,
+    RXI: embedded_hal::serial::Read<u8>,
+    TXO::Error: core::fmt::Debug,
+    RXI::Error: core::fmt::Debug,
     RXLEN: heapless::ArrayLength<u8>,
     TXLEN: heapless::ArrayLength<u8>,
 {
@@ -165,7 +170,7 @@ where
     /// TX while we send an NACK.
     const SFRAME_NACK: [u8; 4] = [Self::HEADER_NACK, 0, 0x3C, 0xF7];
 
-    pub fn new(writer: TX, reader: RX, poll_limit: u32) -> Illyria<TX, RX, TXLEN, RXLEN> {
+    pub fn new(writer: TXO, reader: RXI, poll_limit: u32) -> Illyria<TXM, RXM, TXO, RXI, TXLEN, RXLEN> {
         Illyria {
             poll_limit,
             writer,
@@ -177,6 +182,7 @@ where
             next_tx_colour: Colour::Purple,
             rx_state: RxState::WantFrameDelimiter,
             rx_colour: Colour::Purple,
+            _phantom: core::marker::PhantomData
         }
     }
 
@@ -184,10 +190,7 @@ where
         self.tx_buffer.capacity() - Self::FRAME_OVERHEAD
     }
 
-    pub fn send<M>(&mut self, message: &M) -> Result<(), Error<TX::Error, RX::Error>>
-    where
-        M: serde::ser::Serialize,
-    {
+    pub fn send(&mut self, message: &TXM) -> Result<(), Error<TXO::Error, RXI::Error>> {
         if self.tx_buffer.len() != 0 {
             return Err(Error::PacketInFlight);
         }
@@ -245,7 +248,7 @@ where
         self.tx_state = TxState::Idle;
     }
 
-    fn writer_write(&mut self, byte: u8) -> Result<(), Error<TX::Error, RX::Error>> {
+    fn writer_write(&mut self, byte: u8) -> Result<(), Error<TXO::Error, RXI::Error>> {
         match self.writer.write(byte) {
             Ok(()) => Ok(()),
             Err(nb::Error::WouldBlock) => Err(Error::TransportWouldBlock),
@@ -253,7 +256,7 @@ where
         }
     }
 
-    fn reader_read(&mut self) -> Result<u8, Error<TX::Error, RX::Error>> {
+    fn reader_read(&mut self) -> Result<u8, Error<TXO::Error, RXI::Error>> {
         match self.reader.read() {
             Ok(b) => Ok(b),
             Err(nb::Error::WouldBlock) => Err(Error::TransportWouldBlock),
@@ -277,7 +280,7 @@ where
 
     /// Pumps the TX state machine. Returns `true` if it makes sense to call this function again right away.
     /// Returns `false` if we're stuck waiting for an ack and you should wait a while before trying again.
-    pub fn run_tx(&mut self) -> Result<WaitingForAckNack, Error<TX::Error, RX::Error>> {
+    pub fn run_tx(&mut self) -> Result<WaitingForAckNack, Error<TXO::Error, RXI::Error>> {
         let mut result = WaitingForAckNack::No;
         self.tx_state = match self.tx_state {
             TxState::Idle => {
@@ -364,7 +367,8 @@ where
         }
     }
 
-    pub fn run_rx(&mut self) -> Result<(), Error<TX::Error, RX::Error>> {
+    pub fn run_rx(&mut self) -> Result<Option<RXM>, Error<TXO::Error, RXI::Error>> {
+        let mut result = None;
         let next_byte = self.reader_read()?;
         if next_byte == 0 {
             // Applies in any state
@@ -445,6 +449,16 @@ where
                                     // A. Update our expectation.
                                     self.rx_colour = Colour::next(Colour::Red);
                                     // B. Tell the higher layer about it.
+                                    match postcard::from_bytes(&self.rx_buffer[2..]) {
+                                        Ok(m) => {
+                                            result = Some(m)
+                                        }
+                                        Err(e) => {
+                                            panic!("Failed to decode: {:?}", e);
+                                            // Failed to decode message. Drop
+                                            // it on the floor.
+                                        }
+                                    }
                                 }
                             }
                             Self::HEADER_BLUE_IFRAME => {
@@ -455,6 +469,16 @@ where
                                     // A. Update our expectation.
                                     self.rx_colour = Colour::Blue.next();
                                     // B. Tell the higher layer about it.
+                                    match postcard::from_bytes(&self.rx_buffer[2..]) {
+                                        Ok(m) => {
+                                            result = Some(m)
+                                        }
+                                        Err(e) => {
+                                            panic!("Failed to decode: {:?}", e);
+                                            // Failed to decode message. Drop
+                                            // it on the floor.
+                                        }
+                                    }
                                 }
                             }
                             Self::HEADER_PURPLE_IFRAME => {
@@ -465,6 +489,16 @@ where
                                     // A. Update our expectation.
                                     self.rx_colour = Colour::Purple.next();
                                     // B. Tell the higher layer about it.
+                                    match postcard::from_bytes(&self.rx_buffer[2..]) {
+                                        Ok(m) => {
+                                            result = Some(m)
+                                        }
+                                        Err(e) => {
+                                            panic!("Failed to decode: {:?}", e);
+                                            // Failed to decode message. Drop
+                                            // it on the floor.
+                                        }
+                                    }
                                 }
                             }
                             Self::HEADER_ACK => {
@@ -495,14 +529,14 @@ where
                 }
             };
         }
-        Ok(())
+        Ok(result)
     }
 
-    pub fn access_writer(&mut self) -> &mut TX {
+    pub fn access_writer(&mut self) -> &mut TXO {
         &mut self.writer
     }
 
-    pub fn access_reader(&mut self) -> &mut RX {
+    pub fn access_reader(&mut self) -> &mut RXI {
         &mut self.reader
     }
 }
@@ -511,7 +545,7 @@ where
 mod tests {
     use super::*;
     use nb;
-    use serde::Serialize;
+    use serde::{Serialize, Deserialize};
     use std::collections::VecDeque;
 
     #[derive(Debug)]
@@ -530,7 +564,7 @@ mod tests {
         }
     }
 
-    #[derive(Serialize)]
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     enum Message {
         A,
         B(u32),
@@ -568,7 +602,7 @@ mod tests {
         }
     }
 
-    type MyIllyria = Illyria<TestWriter, TestReader, heapless::consts::U66, heapless::consts::U66>;
+    type MyIllyria = Illyria<Message, Message, TestWriter, TestReader, heapless::consts::U66, heapless::consts::U66>;
 
     #[test]
     fn timeout_message() {
@@ -634,17 +668,80 @@ mod tests {
         illyria.access_reader().source.push_back(0xC8); // Checksum 1
         illyria.access_reader().source.push_back(0); // COBS delimiter
 
+        let mut seen = false;
         for _ in 0..20 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(None) => {}
+                Ok(Some(m)) => {
+                    assert!(!seen);
+                    assert_eq!(m, Message::A);
+                    seen = true;
+                }
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
                 }
             }
         }
+        assert!(seen);
 
+        // Should have sent an ACK
+        illyria.access_writer().check(&[
+            0,    // COBS delimiter
+            2,    // Gap to next zero
+            2,    // Frame type
+            3,    // Length
+            0x3C, // Checksum 0
+            0xF7, // Checksum 1
+            0,    // COBS delimiter
+        ]);
+    }
+
+    #[test]
+    fn rx_message2() {
+        let t = TestWriter {
+            out_tx_buffer: Vec::new(),
+        };
+
+        let r = TestReader {
+            source: VecDeque::new(),
+        };
+
+        let mut illyria = MyIllyria::new(t, r, 10);
+
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+        illyria.access_reader().source.push_back(5); // Gap to next zero
+        illyria.access_reader().source.push_back(1); // Frame type
+        illyria.access_reader().source.push_back(5); // Length
+        illyria.access_reader().source.push_back(1); // Payload 0 - Message type B
+        illyria.access_reader().source.push_back(5); // Payload 1
+        illyria.access_reader().source.push_back(1); // Payload 2
+        illyria.access_reader().source.push_back(1); // Payload 3
+        illyria.access_reader().source.push_back(3); // Payload 4
+        illyria.access_reader().source.push_back(0x62); // Checksum 0
+        illyria.access_reader().source.push_back(0x31); // Checksum 1
+        illyria.access_reader().source.push_back(0); // COBS delimiter
+
+        let mut seen = false;
+        for _ in 0..20 {
+            illyria.run_tx().unwrap();
+            match illyria.run_rx() {
+                Ok(None) => {}
+                Ok(Some(m)) => {
+                    assert!(!seen);
+                    assert_eq!(m, Message::B(5));
+                    seen = true;
+                }
+                Err(Error::TransportWouldBlock) => {}
+                Err(e) => {
+                    panic!("Got error {:?}", e);
+                }
+            }
+        }
+        assert!(seen);
+
+        // Should have sent an ACK
         illyria.access_writer().check(&[
             0,    // COBS delimiter
             2,    // Gap to next zero
@@ -683,7 +780,7 @@ mod tests {
         for _ in 0..20 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(..) => {}
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
@@ -719,7 +816,7 @@ mod tests {
         for _ in 0..17 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(..) => {}
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
@@ -748,7 +845,7 @@ mod tests {
         for _ in 0..50 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(..) => {}
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
@@ -780,7 +877,7 @@ mod tests {
             for _ in 0..17 {
                 illyria.run_tx().unwrap();
                 match illyria.run_rx() {
-                    Ok(()) => {}
+                    Ok(..) => {}
                     Err(Error::TransportWouldBlock) => {}
                     Err(e) => {
                         panic!("Got error {:?}", e);
@@ -804,7 +901,7 @@ mod tests {
             for _ in 0..50 {
                 illyria.run_tx().unwrap();
                 match illyria.run_rx() {
-                    Ok(()) => {}
+                    Ok(..) => {}
                     Err(Error::TransportWouldBlock) => {}
                     Err(e) => {
                         panic!("Got error {:?}", e);
@@ -831,7 +928,7 @@ mod tests {
         for _ in 0..17 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(..) => {}
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
@@ -860,7 +957,7 @@ mod tests {
         for _ in 0..50 {
             illyria.run_tx().unwrap();
             match illyria.run_rx() {
-                Ok(()) => {}
+                Ok(..) => {}
                 Err(Error::TransportWouldBlock) => {}
                 Err(e) => {
                     panic!("Got error {:?}", e);
